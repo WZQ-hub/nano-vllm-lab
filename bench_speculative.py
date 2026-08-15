@@ -6,7 +6,7 @@ from transformers import AutoTokenizer
 from nanovllm import LLM, SamplingParams
 from nanovllm.config import Config
 from nanovllm.engine.model_runner import ModelRunner
-from nanovllm.speculative_decoding import SpeculativeDecoder
+from nanovllm.spec_decoding.speculative_decoding import SpeculativeDecoder
 
 
 def benchmark_standard(llm, prompts, sampling_params):

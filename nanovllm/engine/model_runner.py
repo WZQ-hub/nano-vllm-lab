@@ -219,6 +219,12 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def run_logits(self, seqs: list[Sequence], is_prefill: bool) -> torch.Tensor:
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        logits = self.run_model(input_ids, positions, is_prefill)
+        reset_context()
+        return logits
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config

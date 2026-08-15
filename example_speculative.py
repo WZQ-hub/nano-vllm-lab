@@ -1,66 +1,70 @@
-import os
-from transformers import AutoTokenizer
+import os 
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from nanovllm.config import Config
-from nanovllm.engine.model_runner import ModelRunner
-from nanovllm.sampling_params import SamplingParams
-from nanovllm.speculative_decoding import SpeculativeDecoder
+from nanovllm.spec_decoding.speculative_decoding import speculative_round
+
+TARGET_PATH = os.environ.get(
+    "TARGET_MODEL",
+    os.path.expanduser("./huggingface/Qwen3-8B"),
+)
+
+DRAFT_PATH = os.environ.get(
+    "DRAFT_MODEL",
+    os.path.expanduser("./huggingface/Qwen3-0.6B"),
+)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+type = torch.bfloat16 if device == "cuda" else torch.float32
+
+class HFLogitsModel:
+    def __init__(self, model_path):
+        self.model = (
+            AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=type)
+            .to(device)
+            .eval()
+        )
+
+    @torch.inference_mode()
+    def logits(self, input_ids):
+        return self.model(input_ids = input_ids, use_cache=False).logits
 
 
-def main():
-    # Model paths
-    target_model_path = os.path.expanduser("./huggingface/Qwen3-8B/")
-    draft_model_path = os.path.expanduser("./huggingface/Qwen3-0.6B/")
+tokenizer = AutoTokenizer.from_pretrained(TARGET_PATH)
+target_model = HFLogitsModel(TARGET_PATH)
+draft_model = HFLogitsModel(DRAFT_PATH)
 
-    # Load tokenizer (shared between target and draft)
-    tokenizer = AutoTokenizer.from_pretrained(target_model_path)
+prompt = "Explain speculative decoding in one short paragraph."
+prompt_ids = tokenizer(
+    prompt,
+    return_tensors="pt",
+).input_ids.to(device)
 
-    # Initialize target model runner
-    target_config = Config(
-        model=target_model_path,
-        enforce_eager=True,
-        tensor_parallel_size=1,
-        max_num_seqs=1,
-        gpu_memory_utilization=0.6,
+generated_ids = prompt_ids
+max_rounds = 8
+k = 4
+
+for _ in range(max_rounds):
+    new_tokens = speculative_round(
+        prompt_ids=generated_ids,
+        target_model=target_model,
+        draft_model=draft_model,
+        k=k,
     )
-    target_runner = ModelRunner(target_config, rank=0, event=[])
 
-    # Initialize speculative decoder
-    decoder = SpeculativeDecoder(
-        target_model_runner=target_runner,
-        draft_model_path=draft_model_path,
-        tokenizer=tokenizer,
-        num_speculative_tokens=5,  # Generate 5 draft tokens per iteration
+    generated_ids = torch.cat(
+        [generated_ids, new_tokens],
+        dim=1,
     )
 
-    # Prepare prompt
-    prompt = "introduce yourself"
-    prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    if tokenizer.eos_token_id in new_tokens[0].tolist():
+        break
 
-    # Sampling parameters
-    sampling_params = SamplingParams(
-        temperature=0.6,
-        max_tokens=256,
-        ignore_eos=False,
-    )
+completion_ids = generated_ids[0, prompt_ids.shape[1]:].tolist()
 
-    # Generate with speculative decoding
-    print(f"Prompt: {prompt!r}")
-    print("\nGenerating with speculative decoding...")
-
-    output = decoder.generate(prompt, sampling_params)
-
-    print(f"\nCompletion: {output['text']!r}")
-    print(f"\nGenerated {len(output['token_ids'])} tokens")
-
-    # Cleanup
-    decoder.cleanup()
-    target_runner.exit()
-
-
-if __name__ == "__main__":
-    main()
+print("Prompt:", prompt)
+print("Completion:", tokenizer.decode(
+    completion_ids,
+    skip_special_tokens=True,
+))
+print("Generated token count:", len(completion_ids))

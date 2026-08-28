@@ -1,209 +1,165 @@
+import argparse
 import os
-import time
-from random import randint, seed
-from transformers import AutoTokenizer
+import traceback
+from time import perf_counter
 
-from nanovllm import LLM, SamplingParams
-from nanovllm.config import Config
-from nanovllm.engine.model_runner import ModelRunner
-from nanovllm.spec_decoding.speculative_decoding import SpeculativeDecoder
+import torch.multiprocessing as mp
 
 
-def benchmark_standard(llm, prompts, sampling_params):
-    """Benchmark standard generation (no speculative decoding)."""
-    print("\n" + "="*60)
-    print("Benchmarking STANDARD generation (baseline)")
-    print("="*60)
+TARGET_PATH = os.environ.get("TARGET_MODEL", "./huggingface/Qwen3-8B/")
+DRAFT_PATH = os.environ.get("DRAFT_MODEL", "./huggingface/Qwen3-0.6B/")
 
-    # Warmup
-    llm.generate(["Warmup"], SamplingParams(max_tokens=10), use_tqdm=False)
-
-    # Actual benchmark
-    start_time = time.time()
-    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
-    elapsed_time = time.time() - start_time
-
-    # Calculate stats
-    total_tokens = sum(len(output["token_ids"]) for output in outputs)
-    throughput = total_tokens / elapsed_time
-
-    print(f"\n📊 Standard Generation Results:")
-    print(f"  Total output tokens: {total_tokens}")
-    print(f"  Time: {elapsed_time:.2f}s")
-    print(f"  Throughput: {throughput:.2f} tok/s")
-
-    return {
-        "total_tokens": total_tokens,
-        "time": elapsed_time,
-        "throughput": throughput,
-    }
+# 用真实文本，不用随机 token id：接受率取决于草稿模型能不能预测目标模型的输出，
+# 喂随机 token 会把两个模型都推到分布外，测出来的接受率没有参考价值。
+PROMPTS = [
+    "Explain the theory of relativity in simple terms.",
+    "Write a short story about a robot learning to paint.",
+    "List the top 10 programming languages and their use cases.",
+    "What are the key differences between Python and JavaScript?",
+    "Describe the process of photosynthesis.",
+    "How does a neural network work?",
+    "Explain quantum computing to a 10-year-old.",
+    "Describe the water cycle in nature.",
+]
 
 
-def benchmark_speculative(target_runner, draft_model_path, tokenizer, prompts, sampling_params_list):
-    """Benchmark speculative decoding."""
-    print("\n" + "="*60)
-    print("Benchmarking SPECULATIVE DECODING")
-    print("="*60)
+def _worker(queue, args, k):
+    """在子进程里跑一个配置。进程退出时显存自动释放。"""
+    try:
+        from transformers import AutoTokenizer
+        from nanovllm import LLM, SamplingParams
 
-    # Initialize speculative decoder
-    decoder = SpeculativeDecoder(
-        target_model_runner=target_runner,
-        draft_model_path=draft_model_path,
-        tokenizer=tokenizer,
-        num_speculative_tokens=5,
-    )
+        tokenizer = AutoTokenizer.from_pretrained(args.target)
+        prompts = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": PROMPTS[i % len(PROMPTS)]}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for i in range(args.num_seqs)
+        ]
+        # ignore_eos + 固定 max_tokens：让每条序列产出的 token 数确定，吞吐可比
+        sampling_params = SamplingParams(
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            ignore_eos=True,
+        )
 
-    # Warmup
-    warmup_prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": "Hi"}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    decoder.generate(warmup_prompt, SamplingParams(max_tokens=10))
+        llm = LLM(
+            args.target,
+            speculative_model=None if k == 0 else args.draft,
+            num_spec_tokens=k,
+            enforce_eager=args.enforce_eager,
+            tensor_parallel_size=1,
+            max_num_seqs=args.num_seqs,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+        )
 
-    # Actual benchmark
-    outputs = []
-    start_time = time.time()
+        # warmup：触发 dynamo 编译 + cudagraph replay，否则首轮编译开销会算进计时
+        llm.generate(["Benchmark: "], SamplingParams(max_tokens=16, ignore_eos=True), use_tqdm=False)
 
-    for i, (prompt, sp) in enumerate(zip(prompts, sampling_params_list)):
-        print(f"Processing {i+1}/{len(prompts)}...", end="\r")
-        output = decoder.generate(prompt, sp)
-        outputs.append(output)
+        for prompt in prompts:
+            llm.add_request(prompt, sampling_params)
 
-    elapsed_time = time.time() - start_time
+        outputs = {}
+        decode_steps = 0
+        t = perf_counter()
+        while not llm.is_finished():
+            finished, num_tokens = llm.step()
+            if num_tokens <= 0:                 # >0 表示 prefill 步
+                decode_steps += 1
+            for seq_id, token_ids in finished:
+                outputs[seq_id] = token_ids
+        elapsed = perf_counter() - t
 
-    # Calculate stats
-    total_tokens = sum(len(output["token_ids"]) for output in outputs)
-    throughput = total_tokens / elapsed_time
+        total_tokens = sum(len(ids) for ids in outputs.values())
+        queue.put(dict(
+            ok=True, k=k,
+            total_tokens=total_tokens,
+            decode_steps=decode_steps,
+            elapsed=elapsed,
+        ))
+    except Exception:
+        queue.put(dict(ok=False, k=k, err=traceback.format_exc()))
 
-    print(f"\n📊 Speculative Decoding Results:")
-    print(f"  Total output tokens: {total_tokens}")
-    print(f"  Time: {elapsed_time:.2f}s")
-    print(f"  Throughput: {throughput:.2f} tok/s")
 
-    # Cleanup
-    decoder.cleanup()
+def run_one(args, k):
+    ctx = mp.get_context("spawn")           # 必须 spawn：fork 会把父进程的 CUDA 状态带坏
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_worker, args=(queue, args, k))
+    proc.start()
+    result = queue.get()                    # 先 get 再 join，避免队列缓冲写满时死锁
+    proc.join()
+    if proc.exitcode != 0 and result.get("ok"):
+        result = dict(ok=False, k=k, err=f"子进程异常退出，exitcode={proc.exitcode}")
+    return result
 
-    return {
-        "total_tokens": total_tokens,
-        "time": elapsed_time,
-        "throughput": throughput,
-    }
+
+def solve_alpha(tokens_per_step, k):
+    """从 E[tokens/step] = 1 + a(1-a^k)/(1-a) 反解逐 token 接受率，二分即可。"""
+    target = tokens_per_step - 1
+    if target <= 0:
+        return 0.0
+    lo, hi = 0.0, 1.0 - 1e-9
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        expected = mid * (1 - mid ** k) / (1 - mid)
+        if expected < target:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
 
 
 def main():
-    seed(0)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target", default=TARGET_PATH)
+    parser.add_argument("--draft", default=DRAFT_PATH)
+    parser.add_argument("-k", "--num-spec-tokens", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6],
+                        help="要扫的 k 值列表，会自动带上 k=0 作为基线")
+    parser.add_argument("--num-seqs", type=int, default=32)
+    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument("--enforce-eager", action="store_true")
+    args = parser.parse_args()
 
-    # Configuration
-    num_prompts = 10  # Use fewer prompts for more realistic comparison
-    target_model_path = os.path.expanduser("~/huggingface/Qwen3-8B/")
-    draft_model_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    configs = [0] + [k for k in args.num_spec_tokens if k > 0]
 
-    print("\n🚀 Speculative Decoding Benchmark")
-    print(f"Target Model: {target_model_path}")
-    print(f"Draft Model: {draft_model_path}")
-    print(f"Number of prompts: {num_prompts}")
+    print(f"target : {args.target}")
+    print(f"draft  : {args.draft}")
+    print(f"batch  : {args.num_seqs} seqs x {args.max_tokens} tokens, temperature={args.temperature}")
+    print(f"backend: {'eager' if args.enforce_eager else 'cudagraph'}\n")
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(target_model_path)
+    results = []
+    for k in configs:
+        label = "baseline" if k == 0 else f"k={k}"
+        print(f"[{label}] running ...", flush=True)
+        res = run_one(args, k)
+        if not res["ok"]:
+            print(f"[{label}] FAILED\n{res['err']}")
+            continue
+        res["throughput"] = res["total_tokens"] / res["elapsed"]
+        res["per_step"] = res["total_tokens"] / res["decode_steps"] if res["decode_steps"] else 0.0
+        results.append(res)
+        print(f"[{label}] {res['elapsed']:.2f}s  {res['throughput']:.1f} tok/s\n", flush=True)
 
-    # Prepare prompts
-    test_prompts = [
-        "Explain the theory of relativity in simple terms.",
-        "Write a short story about a robot learning to paint.",
-        "List the top 10 programming languages and their use cases.",
-        "What are the key differences between Python and JavaScript?",
-        "Describe the process of photosynthesis.",
-        "How does a neural network work?",
-        "What is the capital of France and its history?",
-        "Explain quantum computing to a 10-year-old.",
-        "What are the benefits of meditation?",
-        "Describe the water cycle in nature.",
-    ]
+    if not results:
+        return
 
-    prompts = test_prompts[:num_prompts]
+    baseline = next((r for r in results if r["k"] == 0), None)
 
-    # Apply chat template
-    prompts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        for prompt in prompts
-    ]
-
-    # Sampling parameters
-    sampling_params_list = [
-        SamplingParams(
-            temperature=0.6,
-            max_tokens=randint(100, 256),
-            ignore_eos=False,
-        )
-        for _ in range(num_prompts)
-    ]
-
-    # Single sampling params for standard benchmark
-    sampling_params_uniform = SamplingParams(
-        temperature=0.6,
-        max_tokens=200,
-        ignore_eos=False,
-    )
-
-    # ========================================
-    # Benchmark 1: Standard Generation
-    # ========================================
-    llm = LLM(
-        target_model_path,
-        enforce_eager=True,
-        tensor_parallel_size=1,
-        max_num_seqs=1,
-        gpu_memory_utilization=0.6,
-    )
-
-    standard_results = benchmark_standard(llm, prompts, sampling_params_uniform)
-
-    # ========================================
-    # Benchmark 2: Speculative Decoding
-    # ========================================
-    # Get the model runner from LLMEngine
-    target_runner = llm.model_runner
-
-    speculative_results = benchmark_speculative(
-        target_runner,
-        draft_model_path,
-        tokenizer,
-        prompts,
-        sampling_params_list,
-    )
-
-    # ========================================
-    # Comparison
-    # ========================================
-    print("\n" + "="*60)
-    print("📈 PERFORMANCE COMPARISON")
-    print("="*60)
-
-    speedup = standard_results["time"] / speculative_results["time"]
-    throughput_improvement = (speculative_results["throughput"] / standard_results["throughput"] - 1) * 100
-
-    print(f"\n{'Method':<25} {'Time (s)':<12} {'Throughput (tok/s)':<20}")
-    print("-" * 60)
-    print(f"{'Standard Generation':<25} {standard_results['time']:<12.2f} {standard_results['throughput']:<20.2f}")
-    print(f"{'Speculative Decoding':<25} {speculative_results['time']:<12.2f} {speculative_results['throughput']:<20.2f}")
-    print("-" * 60)
-    print(f"\n🎯 Speedup: {speedup:.2f}x")
-    print(f"🎯 Throughput improvement: {throughput_improvement:+.1f}%")
-
-    if speedup > 1.5:
-        print("\n✅ Speculative decoding is working well!")
-    elif speedup > 1.0:
-        print("\n⚠️  Moderate speedup. Consider tuning num_speculative_tokens.")
-    else:
-        print("\n❌ Speculative decoding is slower. Check acceptance rate and model compatibility.")
-
-    # Cleanup
-    llm.exit()
+    print("=" * 74)
+    print(f"{'config':<10} {'time(s)':>9} {'tok/s':>10} {'speedup':>9} {'tok/step':>10} {'alpha':>8}")
+    print("-" * 74)
+    for r in results:
+        label = "baseline" if r["k"] == 0 else f"k={r['k']}"
+        speedup = f"{r['throughput'] / baseline['throughput']:.2f}x" if baseline else "-"
+        alpha = f"{solve_alpha(r['per_step'], r['k']):.3f}" if r["k"] else "-"
+        print(f"{label:<10} {r['elapsed']:>9.2f} {r['throughput']:>10.1f} {speedup:>9} "
+              f"{r['per_step']:>10.2f} {alpha:>8}")
+    print("=" * 74)
+    print("alpha = 逐 token 接受率，理论上不随 k 变化；若明显随 k 漂移说明记账或索引有问题")
 
 
 if __name__ == "__main__":

@@ -52,6 +52,7 @@ def _worker(queue, args, k):
             enforce_eager=args.enforce_eager,
             tensor_parallel_size=1,
             max_num_seqs=args.num_seqs,
+            max_num_batched_tokens=args.max_num_batched_tokens,
             gpu_memory_utilization=args.gpu_memory_utilization,
         )
 
@@ -62,7 +63,7 @@ def _worker(queue, args, k):
             llm.add_request(prompt, sampling_params)
 
         outputs = {}
-        decode_steps = prefill_steps = prefill_tokens = 0
+        decode_steps = prefill_steps = prefill_tokens = seq_steps = 0
         t = perf_counter()
         while not llm.is_finished():
             finished, num_tokens = llm.step()
@@ -71,6 +72,7 @@ def _worker(queue, args, k):
                 prefill_tokens += num_tokens
             else:
                 decode_steps += 1
+                seq_steps += -num_tokens    # llm_engine 在 decode 分支返回 -len(seqs)
             for seq_id, token_ids in finished:
                 outputs[seq_id] = token_ids
         elapsed = perf_counter() - t
@@ -80,6 +82,7 @@ def _worker(queue, args, k):
             ok=True, k=k,
             total_tokens=total_tokens,
             decode_steps=decode_steps,
+            seq_steps=seq_steps,
             prefill_steps=prefill_steps,
             prefill_tokens=prefill_tokens,
             num_blocks=len(llm.scheduler.block_manager.blocks),
@@ -126,7 +129,9 @@ def main():
     parser.add_argument("--num-seqs", type=int, default=32)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=4096,
+                        help="warmup 的激活峰值按它算，调小能给 KV cache 腾出预算")
     parser.add_argument("--enforce-eager", action="store_true")
     args = parser.parse_args()
 
@@ -146,7 +151,7 @@ def main():
             print(f"[{label}] FAILED\n{res['err']}")
             continue
         res["throughput"] = res["total_tokens"] / res["elapsed"]
-        res["per_step"] = res["total_tokens"] / res["decode_steps"] if res["decode_steps"] else 0.0
+        res["per_step"] = res["total_tokens"] / res["seq_steps"] if res["seq_steps"] else 0.0
         results.append(res)
         print(f"[{label}] {res['elapsed']:.2f}s  {res['throughput']:.1f} tok/s  "
               f"blocks={res['num_blocks']}  prefill: {res['prefill_steps']} 步 / "
@@ -158,7 +163,7 @@ def main():
     baseline = next((r for r in results if r["k"] == 0), None)
 
     print("=" * 74)
-    print(f"{'config':<10} {'time(s)':>9} {'tok/s':>10} {'speedup':>9} {'tok/step':>10} "
+    print(f"{'config':<10} {'time(s)':>9} {'tok/s':>10} {'speedup':>9} {'tok/seq/step':>13} "
           f"{'alpha':>8} {'blocks':>7} {'reprefill':>10}")
     print("-" * 90)
     for r in results:
@@ -168,8 +173,10 @@ def main():
         # 正常情况下每条序列只 prefill 一次；多出来的都是被 preempt 后重跑的
         reprefill = r["prefill_tokens"] / max(r["total_tokens"], 1)
         print(f"{label:<10} {r['elapsed']:>9.2f} {r['throughput']:>10.1f} {speedup:>9} "
-              f"{r['per_step']:>10.2f} {alpha:>8} {r['num_blocks']:>7} {reprefill:>9.2f}x")
+              f"{r['per_step']:>13.2f} {alpha:>8} {r['num_blocks']:>7} {reprefill:>9.2f}x")
     print("=" * 90)
+    print("tok/seq/step = 每条序列每个 decode step 产出的 token 数。baseline 恒为 1.00，")
+    print("               spec 上限 k+1。这才是判断 spec 有没有生效的指标")
     print("alpha     = 逐 token 接受率，理论上不随 k 变化；若随 k 明显漂移说明记账或索引有问题")
     print("reprefill = prefill token 数 / 产出 token 数。健康值 <0.2；接近或超过 1 说明")
     print("            KV block 不够，序列被反复 preempt 后从头重跑，这才是拖慢的主因")

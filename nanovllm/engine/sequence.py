@@ -24,6 +24,8 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
+        self.draft_token_ids = []
+        self.draft_cached_tokens = 0
         self.is_prefill = True
         self.block_table = []
         self.temperature = sampling_params.temperature
@@ -60,6 +62,10 @@ class Sequence:
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
+    @property
+    def num_logits(self):
+        return 1 + len(self.draft_token_ids)
+
     def block(self, i):
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
@@ -68,6 +74,12 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+
+    def tokens_in(self, start: int, end: int):
+        n = len(self.token_ids)
+        if end <= n:
+            return self.token_ids[start: end]
+        return self.token_ids[start: n] + self.draft_token_ids[max(n, start) - n: end - n]
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids

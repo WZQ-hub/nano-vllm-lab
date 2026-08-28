@@ -62,11 +62,14 @@ def _worker(queue, args, k):
             llm.add_request(prompt, sampling_params)
 
         outputs = {}
-        decode_steps = 0
+        decode_steps = prefill_steps = prefill_tokens = 0
         t = perf_counter()
         while not llm.is_finished():
             finished, num_tokens = llm.step()
-            if num_tokens <= 0:                 # >0 表示 prefill 步
+            if num_tokens > 0:                  # >0 表示 prefill 步
+                prefill_steps += 1
+                prefill_tokens += num_tokens
+            else:
                 decode_steps += 1
             for seq_id, token_ids in finished:
                 outputs[seq_id] = token_ids
@@ -77,6 +80,9 @@ def _worker(queue, args, k):
             ok=True, k=k,
             total_tokens=total_tokens,
             decode_steps=decode_steps,
+            prefill_steps=prefill_steps,
+            prefill_tokens=prefill_tokens,
+            num_blocks=len(llm.scheduler.block_manager.blocks),
             elapsed=elapsed,
         ))
     except Exception:
@@ -142,7 +148,9 @@ def main():
         res["throughput"] = res["total_tokens"] / res["elapsed"]
         res["per_step"] = res["total_tokens"] / res["decode_steps"] if res["decode_steps"] else 0.0
         results.append(res)
-        print(f"[{label}] {res['elapsed']:.2f}s  {res['throughput']:.1f} tok/s\n", flush=True)
+        print(f"[{label}] {res['elapsed']:.2f}s  {res['throughput']:.1f} tok/s  "
+              f"blocks={res['num_blocks']}  prefill: {res['prefill_steps']} 步 / "
+              f"{res['prefill_tokens']} tok\n", flush=True)
 
     if not results:
         return
@@ -150,16 +158,21 @@ def main():
     baseline = next((r for r in results if r["k"] == 0), None)
 
     print("=" * 74)
-    print(f"{'config':<10} {'time(s)':>9} {'tok/s':>10} {'speedup':>9} {'tok/step':>10} {'alpha':>8}")
-    print("-" * 74)
+    print(f"{'config':<10} {'time(s)':>9} {'tok/s':>10} {'speedup':>9} {'tok/step':>10} "
+          f"{'alpha':>8} {'blocks':>7} {'reprefill':>10}")
+    print("-" * 90)
     for r in results:
         label = "baseline" if r["k"] == 0 else f"k={r['k']}"
         speedup = f"{r['throughput'] / baseline['throughput']:.2f}x" if baseline else "-"
         alpha = f"{solve_alpha(r['per_step'], r['k']):.3f}" if r["k"] else "-"
+        # 正常情况下每条序列只 prefill 一次；多出来的都是被 preempt 后重跑的
+        reprefill = r["prefill_tokens"] / max(r["total_tokens"], 1)
         print(f"{label:<10} {r['elapsed']:>9.2f} {r['throughput']:>10.1f} {speedup:>9} "
-              f"{r['per_step']:>10.2f} {alpha:>8}")
-    print("=" * 74)
-    print("alpha = 逐 token 接受率，理论上不随 k 变化；若明显随 k 漂移说明记账或索引有问题")
+              f"{r['per_step']:>10.2f} {alpha:>8} {r['num_blocks']:>7} {reprefill:>9.2f}x")
+    print("=" * 90)
+    print("alpha     = 逐 token 接受率，理论上不随 k 变化；若随 k 明显漂移说明记账或索引有问题")
+    print("reprefill = prefill token 数 / 产出 token 数。健康值 <0.2；接近或超过 1 说明")
+    print("            KV block 不够，序列被反复 preempt 后从头重跑，这才是拖慢的主因")
 
 
 if __name__ == "__main__":

@@ -44,9 +44,11 @@ class ModelRunner:
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
-            self.graph_state = self.capture_cudagraph(self.model, hf_config)
             if self.draft_model is not None:
                 self.draft_graph_state = self.capture_cudagraph(self.draft_model, draft_hf_config)
+                self.graph_state = self.capture_cudagraph(self.model, hf_config, query_len=self.num_spec_tokens + 1)
+            else:
+                self.graph_state = self.capture_cudagraph(self.model, hf_config)
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -213,18 +215,22 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, logits_indices=logits_indices)
         return input_ids, positions
 
-    def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = []
+    def prepare_decode(self, seqs: list[Sequence], input_ids: list[int] | None = None, num_draft: int | None = None):
+        ids = []
         positions = []
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            pos = len(seq) + len(seq.draft_token_ids) - 1
-            input_ids.append(seq.tokens_in(pos, pos + 1)[0])
+            nd = len(seq.draft_token_ids) if num_draft is None else num_draft
+            pos = len(seq) + nd - 1
+            if input_ids is None:
+                ids.append(seq.tokens_in(pos, pos + 1)[0])
             positions.append(pos)
             context_lens.append(pos + 1)
             slot_mapping.append(seq.block_table[pos // self.block_size] * self.block_size + pos % self.block_size)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+
+        if input_ids is None:
+            input_ids = torch.tensor(ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -232,6 +238,29 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+
+    def prepare_verify(self, seqs: list[Sequence], k: int):
+        ids = []
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        for seq in seqs:
+            assert len(seq.draft_token_ids) == k
+            start, end = seq.num_cached_tokens, len(seq) + k
+            assert end - start == k + 1 # draft model生成的k个草稿token + 1个原本还没有kvcached的token
+            ids.extend(seq.tokens_in(start, end))
+            positions.extend(range(start, end))
+            for pos in range(start, end):
+                slot_mapping.append(seq.block_table[pos // self.block_size] * self.block_size + pos % self.block_size)
+            context_lens.append(end)
+
+        input_ids = torch.tensor(ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=self.prepare_block_tables(seqs), query_len=k + 1)
+
+        return input_ids, positions
     # def prepare_sample(self, seqs: list[Sequence]):
     #     temperatures = [seq.temperature for seq in seqs]
     #     temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -266,24 +295,24 @@ class ModelRunner:
     #         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     @torch.inference_mode()
-    def run_model(self, model, input_ids, positions, is_prefill, graph_state=None):
-        if is_prefill or graph_state is None or input_ids.size(0) > 512:
+    def run_model(self, model, input_ids, positions, is_prefill, graph_state=None, query_len=1):
+        bs = input_ids.size(0) // query_len
+        if is_prefill or graph_state is None or bs > 512:
             return model.compute_logits(model(input_ids, positions))
 
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = graph_state["graphs"][next(x for x in graph_state["graph_bs"] if x >= bs)]
-            graph_vars = graph_state["vars"]
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return model.compute_logits(graph_vars["outputs"][:bs])
+        context = get_context()
+        graph = graph_state["graphs"][next(x for x in graph_state["graph_bs"] if x >= bs)]
+        graph_vars = graph_state["vars"]
+        n = bs * query_len
+        graph_vars["input_ids"][:n] = input_ids
+        graph_vars["positions"][:n] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:n] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        graph.replay()
+        return model.compute_logits(graph_vars["outputs"][:n])
 
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]] | None:
@@ -341,25 +370,27 @@ class ModelRunner:
     #     )
 
     @torch.inference_mode()
-    def capture_cudagraph(self, model, hf_config):
+    def capture_cudagraph(self, model, hf_config, query_len=1):
         config = self.config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64) # decode phase, only one token per sequence
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        n = max_bs * query_len
+        input_ids = torch.zeros(n, dtype=torch.int64) # decode phase, only one token per sequence
+        positions = torch.zeros(n, dtype=torch.int64)
+        slot_mapping = torch.zeros(n, dtype=torch.int32)
+        outputs = torch.zeros(n, hf_config.hidden_size)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
         graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         graphs = {}
 
         for bs in reversed(graph_bs):
+            m = bs * query_len
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = model(input_ids[:bs], positions[:bs])
+            set_context(False, slot_mapping=slot_mapping[:m], context_lens=context_lens[:bs], block_tables=block_tables[:bs], query_len=query_len)
+            outputs[:m] = model(input_ids[:m], positions[:m])
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = model(input_ids[:bs], positions[:bs])
+                outputs[:m] = model(input_ids[:m], positions[:m])
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             graphs[bs] = graph
@@ -381,10 +412,10 @@ class ModelRunner:
 
     @torch.inference_mode()
     def spec_decode(self, seqs: list[Sequence]) -> list[list[int]] | None:
-        _, draft_probs = self.propose(seqs, self.num_spec_tokens)
+        draft_ids, draft_probs = self.propose(seqs, self.num_spec_tokens)
         target_probs = self.verify(seqs)
         assert self.world_size == 1
-        return self.accept(seqs, draft_probs, target_probs)
+        return self.accept(seqs, draft_ids, draft_probs, target_probs)
 
 
     @torch.inference_mode()
@@ -396,41 +427,42 @@ class ModelRunner:
         logits = self.run_model(self.draft_model, input_ids, positions, is_prefill=True, graph_state=graph_state)
         temperatures = self.prepare_sample(seqs, is_prefill=True)
         prob = compute_probs(logits, temperatures)
-        token_ids = sample_from_probs(prob).tolist()
+        token_ids = sample_from_probs(prob)
+        draft_tokens = [token_ids]
         probs.append(prob)
 
-        for _ in range(k - 1):
-            for seq, token_id in zip(seqs, token_ids):
-                seq.draft_token_ids.append(token_id)
-            input_ids, positions = self.prepare_decode(seqs)
+        for i in range(k - 1):
+            input_ids, positions = self.prepare_decode(seqs, input_ids=token_ids, num_draft=i + 1)
             logits = self.run_model(self.draft_model, input_ids, positions, is_prefill=False, graph_state=graph_state)
             prob = compute_probs(logits, temperatures)
             probs.append(prob)
-            token_ids = sample_from_probs(prob).tolist()
+            token_ids = sample_from_probs(prob)
+            draft_tokens.append(token_ids)
 
-        for seq, token_id in zip(seqs, token_ids):
-            seq.draft_token_ids.append(token_id)
-        return [seq.draft_token_ids for seq in seqs], torch.stack(probs, dim=1)
+        draft_ids = torch.stack(draft_tokens, dim=1) # [bs, k]
+        for seq, ids in zip(seqs, draft_ids.tolist()):
+            seq.draft_token_ids.extend(ids)
+        return draft_ids, torch.stack(probs, dim=1)
 
     @torch.inference_mode()
     def verify(self, seqs: list[Sequence]):
-        spans = [(seq.num_cached_tokens, len(seq) + len(seq.draft_token_ids)) for seq in seqs] # 从第一个没有kv cache的token开始
-        input_ids,positions = self.prepare_prefill(seqs, spans)
-        logits = self.run_model(self.model, input_ids, positions, is_prefill=True)
+        k = self.num_spec_tokens
+        input_ids,positions = self.prepare_verify(seqs, k)
+        logits = self.run_model(self.model, input_ids, positions, is_prefill=False,     
+                            graph_state=None if self.enforce_eager else self.graph_state,
+                            query_len=k + 1)
         temperatures = self.prepare_sample(seqs, is_prefill=True)
         probs = compute_probs(logits, temperatures)
         reset_context()
         return probs                            
 
     @torch.inference_mode()
-    def accept(self, seqs: list[Sequence], draft_probs: torch.Tensor, target_probs: torch.Tensor) -> list[list[int]]:
+    def accept(self, seqs: list[Sequence], draft_ids: torch.Tensor, draft_probs: torch.Tensor, target_probs: torch.Tensor) -> list[list[int]]:
         bs, k = draft_probs.size(0), draft_probs.size(1)
         # propose 给每条 seq 都补满了 k 个草稿，num_logits 一律是 k+1，可以直接 view
         assert all(seq.num_logits == k + 1 for seq in seqs)
         target_probs = target_probs.view(bs, k + 1, -1)
 
-        draft_ids = torch.tensor([seq.draft_token_ids for seq in seqs],
-                                 dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
 
         # 只在草稿 token 那一个位置上，各取一个标量概率
         idx = draft_ids.unsqueeze(-1) # [bs, k, 1]

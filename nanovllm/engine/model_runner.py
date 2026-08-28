@@ -10,7 +10,9 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler, compute_probs, sample_from_probs
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+import torch._dynamo
 
+torch._dynamo.config.recompile_limit = 64
 
 class ModelRunner:
 

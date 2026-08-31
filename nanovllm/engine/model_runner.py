@@ -10,6 +10,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler, compute_probs, sample_from_probs
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.spec_decoding.spec_decoding import SpecDecoding
 import torch._dynamo
 
 torch._dynamo.config.recompile_limit = 64
@@ -41,6 +42,7 @@ class ModelRunner:
             load_model(self.draft_model, config.speculative_model)
         self.num_spec_tokens = config.num_spec_tokens
         self.sampler = Sampler()
+        self.spec = SpecDecoding()
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -247,7 +249,7 @@ class ModelRunner:
         for seq in seqs:
             assert len(seq.draft_token_ids) == k
             start, end = seq.num_cached_tokens, len(seq) + k
-            assert end - start == k + 1 # draft model生成的k个草稿token + 1个原本还没有kvcached的token
+            assert end - start == k + 1 # draft model生成的k个草稿token + 1个原本还没有kvcached的token(来自start) len(seq) - 1 = num_cached_tokens + num_scheduled_tokens - 1
             ids.extend(seq.tokens_in(start, end))
             positions.extend(range(start, end))
             for pos in range(start, end):
@@ -415,14 +417,14 @@ class ModelRunner:
         draft_ids, draft_probs = self.propose(seqs, self.num_spec_tokens)
         target_probs = self.verify(seqs)
         assert self.world_size == 1
-        return self.accept(seqs, draft_ids, draft_probs, target_probs)
+        return self.spec.accept(seqs, draft_ids, draft_probs, target_probs)
 
 
     @torch.inference_mode()
     def propose(self, seqs: list[Sequence], k: int) -> tuple[list[list[int]], torch.Tensor]:
         graph_state = None if self.enforce_eager else self.draft_graph_state
         probs = []
-        spans = [(seq.draft_cached_tokens, len(seq)) for seq in seqs]
+        spans = [(seq.draft_cached_tokens, len(seq)) for seq in seqs] # 从上次cached的token开始(相当于第一个没有cached的index)，到当前的seq末尾bonus token 之前
         input_ids, positions = self.prepare_prefill(seqs, spans)
         logits = self.run_model(self.draft_model, input_ids, positions, is_prefill=True, graph_state=graph_state)
         temperatures = self.prepare_sample(seqs, is_prefill=True)
@@ -439,10 +441,10 @@ class ModelRunner:
             token_ids = sample_from_probs(prob)
             draft_tokens.append(token_ids)
 
-        draft_ids = torch.stack(draft_tokens, dim=1) # [bs, k]
+        draft_ids = torch.stack(draft_tokens, dim=1) # [bs, k] 
         for seq, ids in zip(seqs, draft_ids.tolist()):
             seq.draft_token_ids.extend(ids)
-        return draft_ids, torch.stack(probs, dim=1)
+        return draft_ids, torch.stack(probs, dim=1) # prob [bs, vocab] -> [bs, k, vocab]
 
     @torch.inference_mode()
     def verify(self, seqs: list[Sequence]):
@@ -456,27 +458,27 @@ class ModelRunner:
         reset_context()
         return probs                            
 
-    @torch.inference_mode()
-    def accept(self, seqs: list[Sequence], draft_ids: torch.Tensor, draft_probs: torch.Tensor, target_probs: torch.Tensor) -> list[list[int]]:
-        bs, k = draft_probs.size(0), draft_probs.size(1)
-        # propose 给每条 seq 都补满了 k 个草稿，num_logits 一律是 k+1，可以直接 view
-        assert all(seq.num_logits == k + 1 for seq in seqs)
-        target_probs = target_probs.view(bs, k + 1, -1)
+    # @torch.inference_mode()
+    # def accept(self, seqs: list[Sequence], draft_ids: torch.Tensor, draft_probs: torch.Tensor, target_probs: torch.Tensor) -> list[list[int]]:
+    #     bs, k = draft_probs.size(0), draft_probs.size(1)
+    #     # propose 给每条 seq 都补满了 k 个草稿，num_logits 一律是 k+1，可以直接 view
+    #     assert all(seq.num_logits == k + 1 for seq in seqs)
+    #     target_probs = target_probs.view(bs, k + 1, -1) # [bs * (k + 1), vocab] -> [bs, k + 1, vocab]
 
 
-        # 只在草稿 token 那一个位置上，各取一个标量概率
-        idx = draft_ids.unsqueeze(-1) # [bs, k, 1]
-        q_sel = draft_probs.gather(dim=-1, index=idx).squeeze(-1) # [bs, k]
-        p_sel = target_probs[:, :k].gather(dim=-1, index=idx).squeeze(-1) # [bs, k] 不要bonus行
-        accepted = torch.rand_like(q_sel) < p_sel / q_sel.clamp_min(1e-10)
-        n = accepted.to(torch.int32).cumprod(dim=-1).sum(dim=-1) # [bs]，最长 True 前缀
+    #     # 只在草稿 token 那一个位置上，各取一个标量概率
+    #     idx = draft_ids.unsqueeze(-1) # [bs, k, 1]
+    #     q_sel = draft_probs.gather(dim=-1, index=idx).squeeze(-1) # [bs, k]
+    #     p_sel = target_probs[:, :k].gather(dim=-1, index=idx).squeeze(-1) # [bs, k] 不要bonus行
+    #     accepted = torch.rand_like(q_sel) < p_sel / q_sel.clamp_min(1e-10)
+    #     n = accepted.to(torch.int32).cumprod(dim=-1).sum(dim=-1) # [bs]，最长 True 前缀
 
-        # q 末尾补一行零：n == k 时 (p_k - 0)+ 归一化后正好是 bonus 分布，两种情况合并
-        q_pad = torch.cat([draft_probs, torch.zeros_like(draft_probs[:, :1])], dim=1)  # [bs, k+1, vocab]
-        rows = torch.arange(bs, device=n.device)
-        resid = (target_probs[rows, n] - q_pad[rows, n]).clamp_min(0) # [bs, vocab]
-        resid = resid / resid.sum(dim=-1, keepdim=True).clamp_min(1e-10)
-        extra_token = sample_from_probs(resid) # token [bs]
+    #     # q 末尾补一行零：n == k 时 (p_k - 0)+ 归一化后正好是 bonus 分布，两种情况合并
+    #     q_pad = torch.cat([draft_probs, torch.zeros_like(draft_probs[:, :1])], dim=1)  # [bs, k+1, vocab]
+    #     rows = torch.arange(bs, device=n.device)
+    #     resid = (target_probs[rows, n] - q_pad[rows, n]).clamp_min(0) # [bs, vocab]
+    #     resid = resid / resid.sum(dim=-1, keepdim=True).clamp_min(1e-10)
+    #     extra_token = sample_from_probs(resid) # token [bs]
 
-        return [seq.draft_token_ids[:ni] + [e]
-                for seq, ni, e in zip(seqs, n.tolist(), extra_token.tolist())]
+    #     return [seq.draft_token_ids[:ni] + [e]
+    #             for seq, ni, e in zip(seqs, n.tolist(), extra_token.tolist())]

@@ -9,8 +9,7 @@ import torch.multiprocessing as mp
 TARGET_PATH = os.environ.get("TARGET_MODEL", "./huggingface/Qwen3-8B/")
 DRAFT_PATH = os.environ.get("DRAFT_MODEL", "./huggingface/Qwen3-0.6B/")
 
-# 用真实文本，不用随机 token id：接受率取决于草稿模型能不能预测目标模型的输出，
-# 喂随机 token 会把两个模型都推到分布外，测出来的接受率没有参考价值。
+
 PROMPTS = [
     "Explain the theory of relativity in simple terms.",
     "Write a short story about a robot learning to paint.",
@@ -100,7 +99,7 @@ def run_one(args, k):
     result = queue.get()                    # 先 get 再 join，避免队列缓冲写满时死锁
     proc.join()
     if proc.exitcode != 0 and result.get("ok"):
-        result = dict(ok=False, k=k, err=f"子进程异常退出，exitcode={proc.exitcode}")
+        result = dict(ok=False, k=k, err=f"子进程异常退出, exitcode={proc.exitcode}")
     return result
 
 
@@ -174,12 +173,6 @@ def main():
         reprefill = r["prefill_tokens"] / max(r["total_tokens"], 1)
         print(f"{label:<10} {r['elapsed']:>9.2f} {r['throughput']:>10.1f} {speedup:>9} "
               f"{r['per_step']:>13.2f} {alpha:>8} {r['num_blocks']:>7} {reprefill:>9.2f}x")
-    print("=" * 90)
-    print("tok/seq/step = 每条序列每个 decode step 产出的 token 数。baseline 恒为 1.00，")
-    print("               spec 上限 k+1。这才是判断 spec 有没有生效的指标")
-    print("alpha     = 逐 token 接受率，理论上不随 k 变化；若随 k 明显漂移说明记账或索引有问题")
-    print("reprefill = prefill token 数 / 产出 token 数。健康值 <0.2；接近或超过 1 说明")
-    print("            KV block 不够，序列被反复 preempt 后从头重跑，这才是拖慢的主因")
 
 
 if __name__ == "__main__":

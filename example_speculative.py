@@ -35,12 +35,12 @@ def main():
     parser.add_argument("--no-spec", action="store_true",
                         help="不加载 draft 模型，跑纯 target 逐 token 解码作为基线")
     parser.add_argument("--batch", action="store_true",
-                        help="一次跑多条 prompt（每步产出的统计会变成批平均）")
+                        help="一次跑多条 prompt(每步产出的统计会变成批平均)")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--enforce-eager", action="store_true", default=True)
     parser.add_argument("--cudagraph", dest="enforce_eager", action="store_false",
-                        help="关掉 enforce_eager，用 cudagraph")
+                        help="关掉 enforce_eager, 用 cudagraph")
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.target)
@@ -85,11 +85,9 @@ def main():
     print(f"mode            : {'baseline (no spec)' if args.no_spec else f'speculative, k={k}'}")
     print(f"generated tokens: {total_tokens}")
     print(f"decode steps    : {decode_steps}")
-    print(f"tokens / step   : {per_step:.2f}" + ("" if args.batch else f"   (纯 target 时应为 1.00，spec 上限 {k + 1})"))
+    print(f"tokens / step   : {per_step:.2f}")
     if not args.no_spec and decode_steps:
         print(f"accept rate     : {max(per_step - 1, 0) / k:.1%}   (平均接受草稿数 / k)")
-    if args.batch:
-        print("  ↑ 多条 prompt 时各序列结束时间不同，tokens/step 只是批平均，别当接受率读")
     print(f"elapsed         : {elapsed:.2f}s   ({total_tokens / elapsed:.1f} tok/s)")
 
 

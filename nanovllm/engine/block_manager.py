@@ -72,6 +72,7 @@ class BlockManager:
             return -1
         return num_cached_blocks
 
+    # 从block_table=[]时使用，从头分配block
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
         h = -1
@@ -92,24 +93,28 @@ class BlockManager:
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
     def deallocate(self, seq: Sequence):
-        for block_id in reversed(seq.block_table):
+        for block_id in reversed(seq.block_table): # 从新的block开始释放，因为 prefix cache 从序列开头开始匹配
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
+        seq.draft_cached_tokens = 0
+        seq.draft_token_ids.clear()
         seq.block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+    # 判断的是需不需要分配新的block
+    def can_append(self, seq: Sequence, num_tokens: int = 0) -> bool: 
+        return len(self.free_block_ids) >= self.num_blocks_needed(seq, num_tokens)
 
-    def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
+    
+    def may_append(self, seq: Sequence, num_tokens: int = 0):
+        for _ in range(self.num_blocks_needed(seq, num_tokens)):
             seq.block_table.append(self._allocate_block())
 
-    def hash_blocks(self, seq: Sequence):
-        start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
+    def hash_blocks(self, seq: Sequence, start_tokens: int, end_tokens: int):
+        start = start_tokens // self.block_size
+        end = end_tokens // self.block_size
         if start == end: return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
@@ -118,3 +123,8 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+
+    def num_blocks_needed(self, seq: Sequence, num_tokens: int) -> int:
+        total = len(seq) + num_tokens # num_tokens是本次要生成的token数: k
+        needed = (total + self.block_size - 1) // self.block_size
+        return max(0, needed - len(seq.block_table))

@@ -125,7 +125,7 @@ def main():
     parser.add_argument("--draft", default=DRAFT_PATH)
     parser.add_argument("-k", "--num-spec-tokens", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6],
                         help="要扫的 k 值列表，会自动带上 k=0 作为基线")
-    parser.add_argument("--num-seqs", type=int, default=32)
+    parser.add_argument("--num-seqs", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)

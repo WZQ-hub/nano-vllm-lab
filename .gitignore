@@ -195,4 +195,12 @@ cython_debug/
 .cursorindexingignore
 
 notes/
-docs/
+docs/nanovllm/quantization/Qwen3-8B-W8A16/ huggingface/
+nanovllm/quantization/Qwen3-8B-W8A16/ huggingface/
+nanovllm/quantization/Qwen3-8B-W8A16/ huggingface/
+nanovllm/quantization/Qwen3-8B-W8A16/ huggingface/
+nanovllm/quantization/Qwen3-8B-W8A16/
+huggingface/
+nanovllm/quantization/Qwen3-8B-W8A16/
+trace_decode_step6.json
+trace_prefill_step6.json

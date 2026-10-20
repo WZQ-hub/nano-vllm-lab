@@ -9,6 +9,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.quantization.GPTQLinearMethod import GPTQLinearMethod
 
 
 class Qwen3Attention(nn.Module):
@@ -24,6 +25,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
+        quant_method: GPTQLinearMethod | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -45,11 +47,13 @@ class Qwen3Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
+            quant_method=quant_method
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            quant_method=quant_method
         )
         if isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
@@ -95,17 +99,20 @@ class Qwen3MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        quant_method: GPTQLinearMethod | None = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
+            quant_method=quant_method
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
+            quant_method=quant_method
         )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
@@ -122,8 +129,32 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        quant_method: GPTQLinearMethod | None = None
     ) -> None:
         super().__init__()
+        quant_config = getattr(config, "quantization_config", None)
+        if quant_config is None:
+            quant_method = None
+        else:
+            if quant_config["quant_method"] != "compressed-tensors":
+                raise ValueError(
+                f"Unsupported quantization method: "
+                f"{quant_config['quant_method']}"
+            )
+
+            weights_config = quant_config["config_groups"]["group_0"]["weights"]
+
+            if (
+                weights_config["num_bits"] != 4
+                or not weights_config["symmetric"]
+            ):
+                raise ValueError(
+                    "Only symmetric W4 quantization is supported"
+                )
+
+            quant_method = GPTQLinearMethod(
+                group_size=weights_config["group_size"]
+            )
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -134,11 +165,13 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            quant_method=quant_method
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            quant_method=quant_method
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
